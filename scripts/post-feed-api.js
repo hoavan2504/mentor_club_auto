@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 /*
  * post-feed-api.js — Đăng bài (ẢNH / VIDEO lên feed) từ bảng "14.3 Đăng bài tự động" lên Facebook Page.
- * KHÁC post-reels-api.js: đăng feed ảnh/video (không phải Reel) và MỖI DÒNG chọn Page riêng
- * qua cột link "Link Page" (trỏ tới bảng 14.1 Pages) → dùng đúng token của page đó.
+ * KHÁC post-reels-api.js: đăng feed ảnh/video (không phải Reel). MỖI DÒNG chọn Page qua cột
+ * link "Link Page" (trỏ tới bảng 14.1 Pages). CHỌN NHIỀU PAGE trên 1 dòng → đăng LẦN LƯỢT lên
+ * TẤT CẢ page đã chọn (mỗi page 1 bài, token riêng); Link bài đăng + Log gộp link mọi page.
  *
  * Chạy:  node post-feed-api.js            (đăng thật các dòng đủ điều kiện)
  *        node post-feed-api.js --dry-run  (chỉ liệt kê, không đăng, không ghi Base)
@@ -191,11 +192,15 @@ function scheduleMs(cell){ if(cell==null)return null; if(typeof cell==='number')
   for(const row of rows){
     const recId=row.record_id;
     if(plain(row.fields[F.status])===DONE) { skip++; continue; }              // đã đăng
-    const pageRecId=linkRecIds(row.fields[F.link])[0];
+    const pageRecIds=linkRecIds(row.fields[F.link]);                          // TẤT CẢ page đã chọn trên dòng
     const atts=Array.isArray(row.fields[F.media])?row.fields[F.media]:[];
-    if(!pageRecId || atts.length===0) { skip++; continue; }                   // dòng chưa sẵn sàng → bỏ qua im lặng
-    const pg=pageMap.get(pageRecId);
-    if(!pg||!pg.fbId||!pg.token){ log(`  [LỖI] ${recId}: Page link không có ID/token trong bảng 14.1`); if(!DRY)await updateRow(tk,recId,{[F.status]:FAIL,[F.log]:`${now()} - Page thiếu ID/token`}); err++; continue; }
+    if(pageRecIds.length===0 || atts.length===0) { skip++; continue; }        // dòng chưa sẵn sàng → bỏ qua im lặng
+
+    // Gom danh sách Page hợp lệ (có ID+token trong 14.1); page thiếu token ghi vào Log.
+    const pages=[], badPages=[];
+    for(const prid of pageRecIds){ const pg=pageMap.get(prid);
+      if(pg && pg.fbId && pg.token) pages.push(pg); else badPages.push(prid); }
+    if(pages.length===0){ log(`  [LỖI] ${recId}: Page link không có ID/token trong bảng 14.1`); if(!DRY)await updateRow(tk,recId,{[F.status]:FAIL,[F.log]:`${now()} - Page thiếu ID/token`}); err++; continue; }
 
     // Chỉ định record_id = đăng ngay dòng đó, bỏ qua kiểm tra lịch.
     if(CFG.RESPECT_SCHEDULE && !CFG.RECORD_ID){ const s=scheduleMs(row.fields[F.schedule]); if(s&&s>nowMs){ log(`  [CHỜ GIỜ] ${recId}: hẹn ${new Date(s).toISOString().slice(0,16)}`); wait++; continue; } }
@@ -207,21 +212,44 @@ function scheduleMs(cell){ if(cell==null)return null; if(typeof cell==='number')
              : /ảnh|hình|image|photo/i.test(loai) ? 'image'
              : (atts.some(isVid)?'reel':'image');
     const files = kind==='reel' ? [ atts.find(isVid)||atts[0] ] : atts.filter(a=>isImg(a)||!isVid(a));
-    log(`  >> ${recId} | ${pg.name} | ${kind} | ${files.length} file | "${caption.slice(0,40).replace(/\n/g,' ')}"`);
+    log(`  >> ${recId} | ${pages.map(p=>p.name).join(', ')} | ${kind} | ${files.length} file | "${caption.slice(0,40).replace(/\n/g,' ')}"`);
     if(DRY){ const c=plain(row.fields[F.comment]).trim(); if(c)log(`     [DRY] comment: ${c.slice(0,60)}`); continue; }
 
     const tmp=[];
     try{
+      // Tải media MỘT LẦN rồi dùng lại cho MỌI page.
       for(let i=0;i<files.length;i++){ const f=files[i]; const p=path.join(os.tmpdir(),`feed_${recId}_${i}_${(f.name||'m').replace(/[^\w.]/g,'')}`);
         await downloadMedia(tk,f.file_token,p); f.path=p; tmp.push(p); }
-      const res = kind==='reel' ? await postReel(pg.fbId,pg.token,files[0],caption)
-                                  : await postPhotos(pg.fbId,pg.token,files,caption);
-      // Auto comment (link ebook) — không làm hỏng bài nếu lỗi.
-      let cmtNote=''; const commentText=plain(row.fields[F.comment]).trim();
-      if(commentText){ try{ await postComment(pg.fbId,pg.token,res.objectId,commentText); cmtNote=' +cmt'; }
-        catch(e){ cmtNote=' (cmt lỗi)'; log(`     ! comment lỗi: ${String(e.message||e).slice(0,120)}`); } }
-      await updateRow(tk,recId,{ [F.status]:DONE, [F.linkPost]:{link:res.permalink,text:'Xem bài'}, [F.log]:`${now()} - OK - ${res.objectId}${cmtNote}` });
-      log(`     ✔ ĐÃ ĐĂNG: ${res.permalink}`); ok++;
+      const commentText=plain(row.fields[F.comment]).trim();
+      const okLinks=[], logLines=[]; let anyOk=false, anyFail=false;
+      // ĐĂNG LẦN LƯỢT lên TỪNG page đã chọn — mỗi page 1 bài, dùng token riêng của page đó.
+      for(const pg of pages){
+        try{
+          const res = kind==='reel' ? await postReel(pg.fbId,pg.token,files[0],caption)
+                                    : await postPhotos(pg.fbId,pg.token,files,caption);
+          // Auto comment (link ebook) — không làm hỏng bài nếu lỗi.
+          let cmtNote='';
+          if(commentText){ try{ await postComment(pg.fbId,pg.token,res.objectId,commentText); cmtNote=' +cmt'; }
+            catch(e){ cmtNote=' (cmt lỗi)'; log(`     ! comment lỗi (${pg.name}): ${String(e.message||e).slice(0,120)}`); } }
+          okLinks.push({name:pg.name,link:res.permalink});
+          logLines.push(`✔ ${pg.name}: ${res.permalink}${cmtNote}`);
+          anyOk=true; log(`     ✔ ${pg.name}: ${res.permalink}`);
+        }catch(e){ const msg=String(e.message||e).slice(0,180); anyFail=true;
+          logLines.push(`✖ ${pg.name}: LỖI ${msg}`); log(`     ✖ ${pg.name} LỖI: ${msg}`); }
+      }
+      for(const prid of badPages){ anyFail=true; logLines.push(`✖ (${prid}): thiếu ID/token`); }
+
+      // GỘP LINK MỌI PAGE VÀO 1 CHỖ: cột Log liệt kê link từng page (bấm được).
+      // "Link bài đăng" là kiểu URL (chỉ chứa 1 link) → trỏ tới bài đầu, ghi rõ tổng số bài.
+      const total = pages.length + badPages.length;
+      const patch = {
+        [F.status]: anyOk ? DONE : FAIL,
+        [F.log]: `${now()} — đăng ${okLinks.length}/${total} page\n${logLines.join('\n')}`.slice(0,900),
+      };
+      if(okLinks.length) patch[F.linkPost]={ link:okLinks[0].link, text: okLinks.length>1?`${okLinks.length} bài — xem Log`:'Xem bài' };
+      await updateRow(tk,recId,patch);
+      if(anyOk){ ok++; if(anyFail) log(`     ⚠ ${recId}: đăng được ${okLinks.length}/${total} page — xem Log.`); }
+      else err++;
     }catch(e){ const msg=String(e.message||e).slice(0,300); log(`     ✖ LỖI: ${msg}`);
       try{await updateRow(tk,recId,{[F.status]:FAIL,[F.log]:`${now()} - LỖI - ${msg}`});}catch{} err++;
     }finally{ tmp.forEach(p=>{try{fs.unlinkSync(p)}catch{}}); }
